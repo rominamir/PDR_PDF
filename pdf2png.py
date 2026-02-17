@@ -26,12 +26,20 @@ from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional, Set
 import multiprocessing as mp
+import sys
+from pathlib import Path
+
+# Add parent directory to path to import sf_connect
+current_dir = Path(__file__).parent.absolute()
+snowflake_dir = current_dir.parent / 'snowflake'
+sys.path.insert(0, str(snowflake_dir))
 
 import numpy as np
 import pandas as pd
 from PIL import Image
 from pdf2image import convert_from_path
 from sqlalchemy import create_engine, text
+import sf_connect
 
 # POSIX advisory locking (only available on Unix). If you're on Windows use `portalocker` instead.
 try:
@@ -54,98 +62,81 @@ MAX_TOTAL_PIXELS = int(os.environ.get("PDR_MAX_PIXELS", 300_000_000))
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
-CONN_STR = (
-    "mssql+pyodbc://rmir@RPTPRODDB/Alliance_RPT"
-    "?driver=ODBC+Driver+18+for+SQL+Server"
-    "&trusted_connection=yes"
-    "&Encrypt=no"
-)
+# Snowflake connection will be established via sf_connect module
+# CONN_STR is now dynamically generated from Snowflake connection
+CONN_STR = None  # Will be set in fetch_metadata_from_snowflake()
 
 DEFAULT_BASE_OUTPUT = Path(os.environ.get("PDR_CONVERT_OUTPUT", "/hspshare/converted_images"))
-DEFAULT_LOG_FOLDER = DEFAULT_BASE_OUTPUT
+DEFAULT_LOG_FOLDER = DEFAULT_BASE_OUTPUT / 'logs'
 PDF2IMAGE_POPPLER_PATH = os.environ.get("PDF2IMAGE_POPPLER_PATH", None)
 LOG_FILENAME = "conversion_log.csv"  # stored in log folder
-CASES_CSV_FILENAME = "logs/logs/cases_needing_conversion.csv"  # CSV with case numbers to process
+CASES_CSV_FILENAME = "/hspshare/converted_images/logs/cases_needing_conversion.csv"  # CSV with case numbers to process
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Keep root logger at INFO level
     format="%(asctime)s | %(levelname)-7s | %(processName)s | %(message)s"
 )
+
+# Set our own logger to DEBUG for detailed logging
 logger = logging.getLogger("pdr_converter_casekey_dateonly")
+logger.setLevel(logging.DEBUG)
+
+# Suppress verbose PIL TIFF debugging messages
+logging.getLogger('PIL').setLevel(logging.INFO)
+logging.getLogger('PIL.TiffImagePlugin').setLevel(logging.INFO)
 
 
 # ---------------------------
 # SQL Query (DOCUMENT_DATE_RECEIVED column name intentionally set)
 # ---------------------------
-SQL_QUERY = text(
-    """
-WITH pdr_files AS (
-      SELECT
-          FileID,
-          TrackingNumber AS case_number,
-          DateOpened AS case_date_opened,
-          ReasonID
-      FROM HSP_RPT.dbo.Files
-      WHERE ReasonID IN (156,157,239)  -- PDR reason IDs
-    ),
+SQL_QUERY = """
+ WITH files AS (
+  SELECT FileID, TrackingNumber, DateOpened, ReasonID
+  FROM  PROD_EDW.DATA_STORE.DS_HSP_FILES -- dbo.Files
+  WHERE 
+     ReasonID IN (156, 157, 239)
+),
 
-    document_mappings AS (
-        SELECT
-            FileId,
-            EntityId AS DocumentID
-        FROM HSP_RPT.dbo.FileEntityMap
-        WHERE EntityType = 'WIN'
-    ),
+doc_mappings AS (
+  SELECT fem.FileId, fem.EntityId::NUMBER AS DocumentID
+  FROM   PROD_EDW.DATA_STORE.DS_HSP_FILEENTITYMAP fem 
+  JOIN files f ON fem.FileId = f.FileID
+  WHERE fem.EntityType = 'WIN'
+),
 
-    claim_mappings AS (
-      SELECT
-          FileId,
-          STRING_AGG(EntityId, ', ') AS claim_ids
-      FROM HSP_RPT.dbo.FileEntityMap
-      WHERE EntityType = 'CLM'
-      GROUP BY FileId
-  )
+claim_mappings AS (
+  -- aggregate claim IDs per FileId (comma separated)
+  SELECT fem.FileId,
+         LISTAGG(fem.EntityId, ', ') WITHIN GROUP (ORDER BY fem.EntityId) AS ClaimIds
+  FROM PROD_EDW.DATA_STORE.DS_HSP_FILEENTITYMAP fem
+  JOIN files f ON fem.FileId = f.FileID
+  WHERE fem.EntityType = 'CLM'
+  GROUP BY fem.FileId
+),
 
-  SELECT
-      pf.case_number,
-      pf.case_date_opened,
-      pf.ReasonID,
-      d.DocumentID,
-      d.DocumentNumber,
-      d.Location,
-
-      -- Build full UNC path (Windows)
-      REPLACE(d.Location, 'domain', 'ccah-alliance.org') + d.DocumentNumber AS unc_path,
-
-      -- Build Linux mount path
-      REPLACE(
-          REPLACE(
-              REPLACE(d.Location, 'domain', 'ccah-alliance.org') + d.DocumentNumber,
-              '\\\\ccah-alliance.org\\hspshare\\',
-              '/hspshare/'
-          ),
-          '\\',
-          '/'
-      ) AS linux_path,
-
-      cm.claim_ids,
-      d.DateReceived AS DOCUMENT_DATE_RECEIVED,
-      d.DateFiled AS document_date_filed,
-      o.Status AS pif_status
-
-    FROM pdr_files pf
-    INNER JOIN document_mappings dm
-        ON pf.FileID = dm.FileId
-    INNER JOIN HSP_RPT.dbo.documents d
-        ON dm.DocumentID = d.DocumentID
-    LEFT JOIN claim_mappings cm
-        ON pf.FileID = cm.FileId
-    left join Alliance_RPT.DataScience.PIF_ML_OPEN o
-            ON pf.case_number = o.casenumber
-    where o.status ='OPEN'
-    ORDER BY pf.case_number, d.DocumentNumber
-"""
+docs AS (
+  SELECT DocumentID, DocumentNumber, Location
+  FROM PROD_EDW.DATA_STORE.DS_HSP_DOCUMENTS -- dbo.documents
+  WHERE DocumentID IN (SELECT DocumentID FROM doc_mappings)
 )
+
+SELECT
+  f.TrackingNumber AS casenumber,
+  d.DocumentNumber,
+  d.DocumentID,
+  -- swap "domain" for actual hostname and append DocumentNumber
+  REPLACE(d.Location, 'domain', 'ccah-alliance.org') || d.DocumentNumber AS FullPath,
+  cm.ClaimIds,
+  f.DateOpened,
+  f.ReasonID
+FROM files f
+JOIN doc_mappings dm ON f.FileID = dm.FileId
+LEFT JOIN claim_mappings cm ON f.FileID = cm.FileId
+JOIN docs d ON dm.DocumentID = d.DocumentID
+ Join PROD_EDW.DATASCIENCE.PIF_LIST_ALL a on a.casenumber = f.TrackingNumber
+and a.status ='OPEN'
+ORDER BY d.DocumentNumber;
+"""
 
 
 # ---------------------------
@@ -153,7 +144,7 @@ WITH pdr_files AS (
 # ---------------------------
 def load_cases_needing_conversion(cases_csv_path: Path) -> Set[str]:
     """
-    Load case numbers from the CSV file (first column, skip header).
+    Load case numbers from the CSV file (from case_number column).
     Returns set of case numbers that need conversion.
     """
     if not cases_csv_path.exists():
@@ -166,13 +157,18 @@ def load_cases_needing_conversion(cases_csv_path: Path) -> Set[str]:
             logger.warning("Cases CSV file is empty at %s", cases_csv_path)
             return set()
         
-        # Get first column (case numbers)
-        first_col = df_cases.columns[0]
-        case_numbers = df_cases[first_col].astype(str).str.strip()
+        # Look for case_number column specifically
+        if 'case_number' not in df_cases.columns:
+            logger.error("CSV file at %s does not have 'case_number' column. Available columns: %s", 
+                        cases_csv_path, list(df_cases.columns))
+            return set()
+        
+        # Get case numbers from case_number column
+        case_numbers = df_cases['case_number'].astype(str).str.strip()
         case_numbers = case_numbers[case_numbers != ''].dropna()
         
         cases_set = set(case_numbers)
-        logger.info("Loaded %d case numbers from %s", len(cases_set), cases_csv_path)
+        logger.info("Loaded %d case numbers from %s (case_number column)", len(cases_set), cases_csv_path)
         return cases_set
     
     except Exception as e:
@@ -183,6 +179,78 @@ def load_cases_needing_conversion(cases_csv_path: Path) -> Set[str]:
 # ---------------------------
 # DB utilities
 # ---------------------------
+def fetch_metadata_from_snowflake(case_numbers_filter: Set[str] = None) -> pd.DataFrame:
+    """Fetch metadata using Snowflake connection via sf_connect module"""
+    logger.info("Connecting to Snowflake...")
+    
+    # Store current working directory and change to snowflake directory for config access
+    import os
+    original_cwd = os.getcwd()
+    snowflake_dir = Path(__file__).parent.parent / 'snowflake'
+    os.chdir(str(snowflake_dir))
+    
+    try:
+        # Get Snowflake connection
+        conn = sf_connect.connect_to_snowflake()
+        if not conn:
+            logger.error("Failed to establish Snowflake connection")
+            return pd.DataFrame()
+        
+        try:
+            cursor = conn.cursor()
+            logger.info("Running query to fetch document metadata from Snowflake...")
+            
+            # Modify query to include case number filtering if provided
+            if case_numbers_filter:
+                # Create a comma-separated list of quoted case numbers for SQL IN clause
+                case_list = "', '".join(case_numbers_filter)
+                filtered_query = SQL_QUERY.replace(
+                    "WHERE \n     ReasonID IN (156, 157, 239)",
+                    f"WHERE \n     ReasonID IN (156, 157, 239)\n     AND TrackingNumber IN ('{case_list}')"
+                )
+                logger.info(f"Filtering query to {len(case_numbers_filter)} specific case numbers")
+            else:
+                filtered_query = SQL_QUERY + " LIMIT 1000"  # Safety limit if no case filter
+                logger.info("No case filter provided, adding safety LIMIT 1000")
+            
+            # Execute query
+            cursor.execute(filtered_query)
+            
+            # Fetch results
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            
+            # Create DataFrame
+            df = pd.DataFrame(rows, columns=columns)
+            logger.info(f"Retrieved {len(df)} rows from Snowflake")
+            
+            if df.empty:
+                logger.warning("Query returned no rows.")
+                return pd.DataFrame()
+            
+            # Normalize column names
+            df.columns = df.columns.str.upper()
+            
+            # Additional filtering in Python as safety (should be minimal now)
+            if case_numbers_filter and not df.empty:
+                initial_count = len(df)
+                df['CASENUMBER'] = df['CASENUMBER'].astype(str).str.strip()
+                df = df[df['CASENUMBER'].isin(case_numbers_filter)]
+                logger.info("Additional Python filtering: %d rows after SQL filter, %d final rows", initial_count, len(df))
+            
+        except Exception as e:
+            logger.exception(f"Error executing Snowflake query: {e}")
+            return pd.DataFrame()
+        finally:
+            conn.close()
+            logger.info("Snowflake connection closed.")
+    
+    finally:
+        # Restore original working directory
+        os.chdir(original_cwd)
+    
+    return df
+
 def fetch_metadata(conn_str: str, case_numbers_filter: Set[str] = None) -> pd.DataFrame:
     logger.info("Connecting to database...")
     engine = create_engine(conn_str)
@@ -203,8 +271,8 @@ def fetch_metadata(conn_str: str, case_numbers_filter: Set[str] = None) -> pd.Da
     # Filter by case numbers if provided
     if case_numbers_filter:
         initial_count = len(df)
-        df['CASE_NUMBER'] = df['CASE_NUMBER'].astype(str).str.strip()
-        df = df[df['CASE_NUMBER'].isin(case_numbers_filter)]
+        df['CASE_NUMBER'] = df['CASENUMBER'].astype(str).str.strip()
+        df = df[df['CASENUMBER'].isin(case_numbers_filter)]
         logger.info("Filtered to %d rows from %d based on cases CSV file", len(df), initial_count)
 
     # Convert DOCUMENT_DATE_RECEIVED to date-only (drop time component)
@@ -242,20 +310,20 @@ def load_previous_log(log_folder: Path) -> pd.DataFrame:
 
 def build_processed_by_case(prev_log: pd.DataFrame) -> Dict[str, Set[str]]:
     """
-    Build mapping: { case_number (str) : set of DOCUMENTNUMBER strings processed for that case }.
-    The log is expected to have 'case' column and 'processed_files' column (JSON list of dicts with 'file' key).
+    Build mapping: { casenumber (str) : set of DOCUMENTNUMBER strings processed for that case }.
+    The log is expected to have 'casenumber' column and 'processed_files' column (JSON list of dicts with 'file' key).
     """
     processed: Dict[str, Set[str]] = {}
     if prev_log.empty:
         return processed
     # normalize column names for safety
     prev_log.columns = prev_log.columns.str.upper()
-    if "CASE" not in prev_log.columns or "PROCESSED_FILES" not in prev_log.columns:
-        logger.warning("Previous log doesn't have 'case' and/or 'processed_files' columns. No per-case processed mapping will be created.")
+    if "CASENUMBER" not in prev_log.columns or "PROCESSED_FILES" not in prev_log.columns:
+        logger.warning("Previous log doesn't have 'casenumber' and/or 'processed_files' columns. No per-case processed mapping will be created.")
         return processed
 
     for _, row in prev_log.iterrows():
-        case = str(row.get("CASE", "")).strip()
+        case = str(row.get("CASENUMBER", "")).strip()
         if not case:
             continue
         entry = row.get("PROCESSED_FILES", "")
@@ -333,19 +401,19 @@ def ensure_poppler_path() -> None:
         logger.debug("Set POPPLER_PATH for pdf2image: %s", PDF2IMAGE_POPPLER_PATH)
 
 
-def load_existing_combined(case_output_folder: Path, case_number: str) -> Optional[Image.Image]:
+def load_existing_combined(case_output_folder: Path, casenumber: str) -> Optional[Image.Image]:
     """
     Try to open existing combined PNG. Handle FileNotFound separately from corrupt/truncated.
     Use a quick existence check right before open and catch FileNotFoundError.
     Returns PIL.Image (copy) or None.
     """
-    path = case_output_folder / f"{case_number}_combined.png"
+    path = case_output_folder / f"{casenumber}_combined.png"
     if not path.exists():
         # nothing there
         return None
 
     # If many workers could race, attempt to acquire a short advisory lock on the folder's lockfile
-    lock_path = case_output_folder / f".{case_number}.lock"
+    lock_path = case_output_folder / f".{casenumber}.lock"
     
     try:
         if fcntl is None:
@@ -419,7 +487,7 @@ def split_images_into_chunks(images: List[Image.Image], max_total_pixels: int) -
     return chunks
 
 
-def append_images_to_combined(existing: Optional[Image.Image], new_images: List[Image.Image], case_number: str, case_output_folder: Path) -> List[str]:
+def append_images_to_combined(existing: Optional[Image.Image], new_images: List[Image.Image], casenumber: str, case_output_folder: Path) -> List[str]:
     """
     Combine existing (optional) + new_images into one or more PNGs, respecting MAX_TOTAL_PIXELS.
     Returns list of output file paths created (strings). If existing is None and the new images
@@ -449,9 +517,9 @@ def append_images_to_combined(existing: Optional[Image.Image], new_images: List[
                 y_offset += img.height
             # name parts sequentially
             if len(chunks) == 1:
-                out_name = f"{case_number}_combined.png"
+                out_name = f"{casenumber}_combined.png"
             else:
-                out_name = f"{case_number}_combined_part{idx}.png"
+                out_name = f"{casenumber}_combined_part{idx}.png"
             out_path = case_output_folder / out_name
             combined.save(out_path, "PNG")
             output_paths.append(str(out_path))
@@ -464,7 +532,7 @@ def append_images_to_combined(existing: Optional[Image.Image], new_images: List[
     except Exception:
         # fallback: avoid loading, treat as absent
         existing = None
-        return append_images_to_combined(None, new_images, case_number, case_output_folder)
+        return append_images_to_combined(None, new_images, casenumber, case_output_folder)
 
     # if merging existing + new images would exceed limit, do NOT attempt to load/merge
     sum_new_pixels = sum(img.width * img.height for img in new_images)
@@ -473,9 +541,9 @@ def append_images_to_combined(existing: Optional[Image.Image], new_images: List[
         logger.warning("Merging existing combined (%d px) + new images (%d px) would exceed MAX_TOTAL_PIXELS (%d). Creating part files for new images and leaving existing file untouched.",
                        existing_pixels, sum_new_pixels, MAX_TOTAL_PIXELS)
         # create parts for new images
-        new_outs = append_images_to_combined(None, new_images, case_number, case_output_folder)
+        new_outs = append_images_to_combined(None, new_images, casenumber, case_output_folder)
         # include original existing path in returned outputs (so log knows it's still present)
-        existing_path = case_output_folder / f"{case_number}_combined.png"
+        existing_path = case_output_folder / f"{casenumber}_combined.png"
         output_paths.extend([str(existing_path)] + new_outs)
         return output_paths
 
@@ -495,10 +563,38 @@ def append_images_to_combined(existing: Optional[Image.Image], new_images: List[
             img = tmp
         combined.paste(img, (0, y_offset))
         y_offset += img.height
-    out_path = case_output_folder / f"{case_number}_combined.png"
+    out_path = case_output_folder / f"{casenumber}_combined.png"
     combined.save(out_path, "PNG")
     output_paths.append(str(out_path))
     return output_paths
+
+
+def convert_unc_to_linux_path(unc_path: str) -> str:
+    """Convert Windows UNC path to Linux mount path"""
+    if not unc_path or not isinstance(unc_path, str):
+        return unc_path
+    
+    linux_path = unc_path
+    
+    # Handle the most common UNC format: \\ccah-alliance.org\hspshare\...
+    if linux_path.startswith('\\\\ccah-alliance.org\\hspshare\\'):
+        linux_path = linux_path[len('\\\\ccah-alliance.org\\hspshare\\'):]
+        linux_path = '/hspshare/' + linux_path
+    # Handle other possible formats
+    elif linux_path.startswith('\\\\ccah-alliance.org/hspshare/'):
+        linux_path = linux_path[len('\\\\ccah-alliance.org/hspshare/'):]
+        linux_path = '/hspshare/' + linux_path
+    elif linux_path.startswith('ccah-alliance.org\\hspshare\\'):
+        linux_path = linux_path[len('ccah-alliance.org\\hspshare\\'):]
+        linux_path = '/hspshare/' + linux_path
+    elif linux_path.startswith('ccah-alliance.org/hspshare/'):
+        linux_path = linux_path[len('ccah-alliance.org/hspshare/'):]
+        linux_path = '/hspshare/' + linux_path
+    
+    # Convert all remaining backslashes to forward slashes
+    linux_path = linux_path.replace('\\', '/')
+    
+    return linux_path
 
 
 def convert_files_to_images(file_records: List[Dict[str, Any]]) -> Tuple[List[Image.Image], List[Dict[str, Any]]]:
@@ -506,15 +602,20 @@ def convert_files_to_images(file_records: List[Dict[str, Any]]) -> Tuple[List[Im
     processed_files: List[Dict[str, Any]] = []
 
     for rec in file_records:
-        file_path = rec.get("LINUX_PATH")
+        file_path = rec.get("FULLPATH")
         file_name = str(rec.get("DOCUMENTNUMBER", "unknown"))
         if not file_path or not isinstance(file_path, str):
             processed_files.append({"file": file_name, "type": "missing_path", "status": "skipped"})
             continue
-        file_path = file_path.strip()
+        
+        # Convert UNC path to Linux path
+        original_path = file_path.strip()
+        file_path = convert_unc_to_linux_path(original_path)
+        
         file_ext = Path(file_path).suffix.lower()
         if not Path(file_path).exists():
-            processed_files.append({"file": file_name, "type": "missing_file", "status": "skipped", "path": file_path})
+            processed_files.append({"file": file_name, "type": "missing_file", "status": "skipped", 
+                                   "original_path": original_path, "converted_path": file_path})
             continue
         try:
             if file_ext == ".pdf":
@@ -542,22 +643,28 @@ def convert_files_to_images(file_records: List[Dict[str, Any]]) -> Tuple[List[Im
     return images, processed_files
 
 
-def convert_case_and_append(case_number: str, rows: List[Dict[str, Any]], output_folder: str) -> Dict[str, Any]:
+def convert_case_and_append(casenumber: str, rows: List[Dict[str, Any]], output_folder: str) -> Dict[str, Any]:
     """
     For a single case: find new documents (rows already filtered upstream),
     convert them to images, append to existing combined if present (safely),
     and save. Returns a log dict for this case. 'output_files' is a list.
     """
     out_folder = Path(output_folder)
-    case_output_folder = out_folder / case_number
+    case_output_folder = out_folder / casenumber
     case_output_folder.mkdir(parents=True, exist_ok=True)
 
-    existing_combined = load_existing_combined(case_output_folder, case_number)
+    logger.debug(f"Processing case {casenumber} with {len(rows)} document records")
+    
+    existing_combined = load_existing_combined(case_output_folder, casenumber)
     new_images, processed_files = convert_files_to_images(rows)
 
     if not new_images:
+        # Log details about why no images were found
+        skipped_files = [f for f in processed_files if f.get('status') == 'skipped']
+        if skipped_files:
+            logger.debug(f"Case {casenumber}: No new images - {len(skipped_files)} files skipped. Sample: {skipped_files[:3]}")
         return {
-            "case": case_number,
+            "case": casenumber,
             "status": "no_new_images",
             "files_count": len(processed_files),
             "processed_files": processed_files,
@@ -566,10 +673,10 @@ def convert_case_and_append(case_number: str, rows: List[Dict[str, Any]], output
 
     try:
         # This returns a list of one or more output file paths.
-        output_files = append_images_to_combined(existing_combined, new_images, case_number, case_output_folder)
+        output_files = append_images_to_combined(existing_combined, new_images, casenumber, case_output_folder)
 
         return {
-            "case": case_number,
+            "case": casenumber,
             "status": "success",
             "files_count": len(processed_files),
             "total_images_new": len(new_images),
@@ -578,9 +685,9 @@ def convert_case_and_append(case_number: str, rows: List[Dict[str, Any]], output
             "run_utc": datetime.now(timezone.utc).isoformat()
         }
     except Exception as e:
-        logger.exception("Error combining/appending images for case %s: %s", case_number, e)
+        logger.exception("Error combining/appending images for case %s: %s", casenumber, e)
         return {
-            "case": case_number,
+            "case": casenumber,
             "status": "error",
             "error": str(e),
             "files_count": len(processed_files),
@@ -591,15 +698,15 @@ def convert_case_and_append(case_number: str, rows: List[Dict[str, Any]], output
 # Worker for multiprocessing
 # ---------------------------
 def worker_entry(args: Tuple[str, List[Dict[str, Any]], str]) -> Dict[str, Any]:
-    case_number, rows, output_folder = args
+    casenumber, rows, output_folder = args
     try:
         ensure_poppler_path()
-        res = convert_case_and_append(case_number, rows, output_folder)
-        logger.info("Worker finished case %s: %s", case_number, res.get("status"))
+        res = convert_case_and_append(casenumber, rows, output_folder)
+        logger.info("Worker finished case %s: %s", casenumber, res.get("status"))
         return res
     except Exception as e:
-        logger.exception("Worker error for case %s: %s", case_number, e)
-        return {"case": case_number, "status": "error", "error": str(e)}
+        logger.exception("Worker error for case %s: %s", casenumber, e)
+        return {"case": casenumber, "status": "error", "error": str(e)}
 
 
 # ---------------------------
@@ -624,7 +731,7 @@ def convert_cases_incremental_parallel(df: pd.DataFrame, base_output_folder: Pat
 
     # Filter out rows already processed *for that case* by checking DOCUMENTNUMBER membership in processed_by_case
     def is_already_processed_row(r: pd.Series) -> bool:
-        case = str(r.get("CASE_NUMBER", "")).strip()
+        case = str(r.get("CASENUMBER", "")).strip()
         docnum = str(r.get("DOCUMENTNUMBER", "")).strip()
         if not case or not docnum:
             return False
@@ -649,12 +756,12 @@ def convert_cases_incremental_parallel(df: pd.DataFrame, base_output_folder: Pat
         logger.info("No new documents to process after filters.")
         return pd.DataFrame()
 
-    df["CASE_NUMBER"] = df["CASE_NUMBER"].astype(str).str.strip()
-    grouped = df.groupby("CASE_NUMBER")
+    df["CASENUMBER"] = df["CASENUMBER"].astype(str).str.strip()
+    grouped = df.groupby("CASENUMBER")
     work_items = []
-    for case_number, grp in grouped:
+    for casenumber, grp in grouped:
         rows = grp.to_dict(orient="records")
-        work_items.append((str(case_number), rows, str(base_output_folder)))
+        work_items.append((str(casenumber), rows, str(base_output_folder)))
     total_cases = len(work_items)
     logger.info("Prepared %d case work items for processing with %d workers", total_cases, workers)
 
@@ -706,16 +813,17 @@ def main(argv: List[str] | None = None) -> None:
     since_cutoff = compute_since_cutoff(prev_log, args.since, args.since_days)
 
     try:
-        df = fetch_metadata(CONN_STR, cases_to_process)
+        # Use Snowflake connection instead of SQL Server
+        df = fetch_metadata_from_snowflake(cases_to_process)
     except Exception as e:
-        logger.exception("Failed to fetch metadata: %s", e)
+        logger.exception("Failed to fetch metadata from Snowflake: %s", e)
         return
 
     if df.empty:
         logger.info("No metadata returned from DB; exiting.")
         return
 
-    required_cols = {"CASE_NUMBER", "LINUX_PATH", "DOCUMENTNUMBER"}
+    required_cols = {"CASENUMBER", "FULLPATH", "DOCUMENTNUMBER"}
     missing = required_cols - set(df.columns)
     if missing:
         logger.warning("Expected columns missing from query result: %s. Script will continue but may skip rows.", missing)
