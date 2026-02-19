@@ -218,10 +218,10 @@ def analyze_with_llm(combined_text: str) -> Dict:
         if len(combined_text) > max_chars:
             combined_text = combined_text[:max_chars] + "...[truncated]"
         
-        prompt = f"""Analyze this document and provide:
-1. Brief overview (1-2 sentences)
-2. 3-5 key points
-3. Notable dates, numbers, or entities
+        prompt = f"""Read the text carefully.
+Identify the main topic, the 3–7 most important points, and the overall conclusion.
+Rewrite the content in a concise, neutral, well-structured summary that preserves meaning and factual accuracy.
+Avoid redundancy and avoid adding new information.
 
 Document:
 {combined_text}
@@ -536,13 +536,13 @@ else:
         )
         
         # OR select from dropdown
-        st.caption("or select from list:")
-        selected_list = st.selectbox(
-            "Select case",
-            [""] + sorted(cases.keys()),
-            format_func=lambda x: "-- Select --" if x == "" else f"{x} ({len(cases[x])} pages)",
-            label_visibility="collapsed"
-        )
+        # st.caption("or select from list:")
+        # selected_list = st.selectbox(
+        #     "Select case",
+        #     [""] + sorted(cases.keys()),
+        #     format_func=lambda x: "-- Select --" if x == "" else f"{x} ({len(cases[x])} pages)",
+        #     label_visibility="collapsed"
+        # )
         
         # Determine selection
         selected = None
@@ -554,8 +554,8 @@ else:
                 similar = [c for c in cases if typed_case.lower() in c.lower()]
                 if similar:
                     st.caption(f"💡 Similar: {similar[0]}")
-        elif selected_list:
-            selected = selected_list
+        # elif selected_list:
+        #     selected = selected_list
         
         if selected:
             st.success(f"✓ {len(cases[selected])} pages")
@@ -744,8 +744,8 @@ else:
 
 # Footer
 st.divider()
-st.markdown("""
-    <div style='text-align: center; color: #64748b; font-size: 0.85rem; padding: 1rem 0;'>
-        💡 <strong>Tips:</strong> Search keywords are highlighted in yellow • AI analysis uses cached OCR for speed
-    </div>
-""", unsafe_allow_html=True)
+# st.markdown("""
+#     <div style='text-align: center; color: #64748b; font-size: 0.85rem; padding: 1rem 0;'>
+#         💡 <strong>Tips:</strong> Search keywords are highlighted in yellow • AI analysis uses cached OCR for speed
+#     </div>
+# """, unsafe_allow_html=True)

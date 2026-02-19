@@ -1,3 +1,7 @@
+"""
+Combines multiple part images into a single combined image for each case folder.
+
+"""
 import os
 import glob
 from PIL import Image
