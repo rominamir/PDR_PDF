@@ -216,9 +216,9 @@ def draw_highlights(image_path: str, boxes: List[Dict], query: str) -> Tuple[Ima
     return result, matches
 
 # ---------------- UI ----------------
-st.set_page_config(page_title="⚡ Ultra Fast Viewer", layout="wide")
+st.set_page_config(page_title="⚡PDR Doc Viewer", layout="wide")
 
-st.title("⚡ Ultra Fast Case Viewer")
+st.title("⚡PDR Doc Viewer")
 st.caption("Images load instantly • Search triggers OCR only when needed")
 
 # Sidebar
@@ -226,18 +226,18 @@ with st.sidebar:
     st.header("⚙️ Settings")
     DATA_ROOT = st.text_input("Folder", DATA_ROOT_DEFAULT)
     
-    st.markdown("---")
+    # st.markdown("---")
     
-    # Check Tesseract
-    try:
-        import pytesseract
-        pytesseract.get_tesseract_version()
-        st.success("✅ Tesseract Ready")
-    except:
-        st.error("❌ Install Tesseract")
-        st.code("sudo apt-get install tesseract-ocr")
+    # # Check Tesseract
+    # try:
+    #     import pytesseract
+    #     pytesseract.get_tesseract_version()
+    #     st.success("✅ Tesseract Ready")
+    # except:
+    #     st.error("❌ Install Tesseract")
+    #     st.code("sudo apt-get install tesseract-ocr")
     
-    st.markdown("---")
+    # st.markdown("---")
     
     # Cache stats
     conn = get_db_connection()
