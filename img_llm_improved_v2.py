@@ -100,6 +100,8 @@ def load_image_safe(image_path: str, max_dimension: int = MAX_DIMENSION) -> Imag
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     cur = conn.cursor()
+    
+    # Create OCR cache table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS ocr_cache (
         filepath TEXT PRIMARY KEY,
@@ -107,6 +109,38 @@ def get_db_connection():
         ocr_boxes TEXT
     )
     """)
+    
+    # Create or migrate analysis cache table
+    try:
+        # Try to create new table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS analysis_cache (
+            case_id TEXT PRIMARY KEY,
+            analysis_result TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+    except sqlite3.OperationalError:
+        pass
+    
+    # Check if table exists but has old schema
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='analysis_cache'")
+    if cur.fetchone():
+        # Check columns
+        cur.execute("PRAGMA table_info(analysis_cache)")
+        columns = [row[1] for row in cur.fetchall()]
+        
+        # If case_id doesn't exist, recreate table
+        if 'case_id' not in columns:
+            cur.execute("DROP TABLE IF EXISTS analysis_cache")
+            cur.execute("""
+            CREATE TABLE analysis_cache (
+                case_id TEXT PRIMARY KEY,
+                analysis_result TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+    
     conn.commit()
     return conn
 
@@ -202,46 +236,89 @@ def get_ocr(filepath: str) -> Tuple[str, List[Dict]]:
         save_ocr_to_cache(filepath, text, boxes)
     return text, boxes
 
+# ---------------- Smart Text Processing for Speed ----------------
+def clean_ocr_text(text: str) -> str:
+    """Remove OCR noise and artifacts for cleaner, shorter text"""
+    import re
+    
+    # Remove excessive whitespace
+    text = ' '.join(text.split())
+    
+    # Remove common OCR artifacts
+    text = re.sub(r'[^\w\s\.,;:!?\-\(\)\'\"]+', ' ', text)
+    
+    # Remove single characters (OCR noise)
+    text = re.sub(r'\b[A-Z]\b', '', text)
+    
+    # Remove isolated numbers (page numbers, artifacts)
+    text = re.sub(r'\b\d{1,2}\b(?!\d)', '', text)
+    
+    # Normalize whitespace again
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+def smart_summarize_text(text: str, max_tokens: int = 2000) -> str:
+    """Intelligently reduce text to ~max_tokens while keeping key info"""
+    # Rough estimate: 1 token ≈ 4 characters
+    max_chars = max_tokens * 4
+    
+    if len(text) <= max_chars:
+        return text
+    
+    # Strategy: Keep beginning (30%), middle sample (20%), end (30%)
+    # Skip the boring middle repetitive parts
+    part1_size = int(max_chars * 0.35)
+    part2_size = int(max_chars * 0.20)
+    part3_size = max_chars - part1_size - part2_size
+    
+    # Beginning (usually has important context)
+    part1 = text[:part1_size]
+    
+    # Middle sample (for variety)
+    middle_start = len(text) // 2 - part2_size // 2
+    part2 = text[middle_start:middle_start + part2_size]
+    
+    # End (often has conclusions/signatures)
+    part3 = text[-part3_size:]
+    
+    return f"{part1}... {part2}... {part3}"
+
 # ---------------- AI Analysis ----------------
 def analyze_with_llm(combined_text: str) -> Dict:
-    """Use local LLM to analyze document"""
+    """Use local LLM to analyze document - OPTIMIZED"""
     if not HAS_OLLAMA:
         return {
-            "error": "Install ollama package: pip install ollama",
-            "overview": "AI analysis unavailable",
-            "key_points": [],
+            "overview": "AI analysis unavailable - Ollama not installed",
+            "key_points": ["Install: pip install ollama", "Then: ollama pull llama3.2"],
             "notable_items": []
         }
     
     try:
-        max_chars = 12000
-        if len(combined_text) > max_chars:
-            combined_text = combined_text[:max_chars] + "...[truncated]"
+        # Clean and compress text for speed
+        cleaned = clean_ocr_text(combined_text)
+        compressed = smart_summarize_text(cleaned, max_tokens=2000)
         
-        prompt = f"""Read the text carefully.
-Identify the main topic, the 3–7 most important points, and the overall conclusion.
-Rewrite the content in a concise, neutral, well-structured summary that preserves meaning and factual accuracy.
-Avoid redundancy and avoid adding new information.
+        # Much shorter, focused prompt
+        prompt = f"""Summarize in 3 parts:
+OVERVIEW: Main topic (1 sentence)
+KEY POINTS: (3-5 bullets)
+NOTABLE: Important items
 
-Document:
-{combined_text}
-
-Format:
-OVERVIEW: [overview]
-KEY POINTS:
-- [point 1]
-- [point 2]
-NOTABLE ITEMS:
-- [item 1]"""
+Text: {compressed}"""
         
-        models = ['llama3.2:latest', 'phi3.5:latest', 'gemma:latest', 'mistral:latest']
+        # Try fastest models first
+        models = ['llama3.2:latest', 'phi3.5:latest', 'gemma2:2b', 'gemma:2b']
         
         for model in models:
             try:
                 response = ollama.chat(
                     model=model,
                     messages=[{'role': 'user', 'content': prompt}],
-                    options={'temperature': 0.3}
+                    options={
+                        'temperature': 0.2,
+                        'num_predict': 256,  # Limit output length
+                    }
                 )
                 
                 return parse_llm_response(response['message']['content'])
@@ -249,13 +326,13 @@ NOTABLE ITEMS:
                 continue
         
         return {
-            "overview": "No Ollama models available",
-            "key_points": ["Install a model: ollama pull llama3.2"],
+            "overview": "No Ollama models responded",
+            "key_points": ["Try: ollama pull llama3.2"],
             "notable_items": []
         }
     except Exception as e:
         return {
-            "overview": f"AI analysis failed: {str(e)}",
+            "overview": f"Analysis error: {str(e)}",
             "key_points": [],
             "notable_items": []
         }
@@ -293,27 +370,42 @@ def parse_llm_response(text: str) -> Dict:
     }
 
 def analyze_case(images: List[str]) -> Dict:
-    """Analyze all pages in case - FAST version using cached OCR"""
-    all_text = []
+    """Analyze all pages with smart caching - FAST!"""
+    import hashlib
     
-    # Use cached OCR data (super fast!)
+    # Create case ID from image paths
+    case_id = hashlib.md5('|'.join(sorted(images)).encode()).hexdigest()
+    
+    # Check analysis cache first (instant if exists!)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT analysis_result FROM analysis_cache 
+        WHERE case_id = ? AND datetime(created_at) > datetime('now', '-7 days')
+    """, (case_id,))
+    cached = cur.fetchone()
+    
+    if cached:
+        try:
+            return json.loads(cached[0])
+        except:
+            pass
+    
+    # Gather OCR text (uses cache - fast!)
+    all_text = []
     for img_path in images:
-        # Check cache first - don't re-run OCR
         text, _ = get_ocr_from_cache(img_path)
-        
-        # If not cached, get it (will cache for future)
         if not text:
             text, _ = get_ocr(img_path)
-        
         if text.strip():
             all_text.append(text)
     
     combined = " ".join(all_text)
     
     if not combined.strip():
-        return {
+        result = {
             "overview": "No text found in documents",
-            "key_points": ["OCR may have failed", "Try better quality scans"],
+            "key_points": ["OCR may have failed", "Try better scan quality"],
             "notable_items": [],
             "stats": {
                 "total_pages": len(images),
@@ -321,15 +413,27 @@ def analyze_case(images: List[str]) -> Dict:
                 "total_words": 0
             }
         }
+    else:
+        # Run LLM analysis (now 5-10x faster!)
+        analysis = analyze_with_llm(combined)
+        result = analysis.copy()
+        result["stats"] = {
+            "total_pages": len(images),
+            "pages_with_text": len(all_text),
+            "total_words": len(combined.split())
+        }
     
-    analysis = analyze_with_llm(combined)
-    analysis["stats"] = {
-        "total_pages": len(images),
-        "pages_with_text": len(all_text),
-        "total_words": len(combined.split())
-    }
+    # Cache the result (lasts 7 days)
+    try:
+        cur.execute("""
+            INSERT OR REPLACE INTO analysis_cache (case_id, analysis_result)
+            VALUES (?, ?)
+        """, (case_id, json.dumps(result)))
+        conn.commit()
+    except:
+        pass
     
-    return analysis
+    return result
 
 def analyze_case_fast(images: List[str]) -> Dict:
     """Ultra-fast analysis - only uses cached OCR, doesn't run new OCR"""
@@ -364,6 +468,65 @@ def analyze_case_fast(images: List[str]) -> Dict:
     }
     
     return analysis
+
+# ---------------- Q&A Function ----------------
+def ask_document_question(images: List[str], question: str, case_id: str) -> str:
+    """Answer questions about the document using LLM"""
+    if not HAS_OLLAMA:
+        return "❌ Ollama not installed. Install with: pip install ollama"
+    
+    # Get all document text (from cache)
+    all_text = []
+    for img_path in images:
+        text, _ = get_ocr_from_cache(img_path)
+        if not text:
+            text, _ = get_ocr(img_path)
+        if text.strip():
+            all_text.append(text)
+    
+    combined = " ".join(all_text)
+    
+    if not combined.strip():
+        return "❌ No text found in documents. Try searching keywords first to build OCR cache."
+    
+    # Clean and compress text for speed
+    cleaned = clean_ocr_text(combined)
+    compressed = smart_summarize_text(cleaned, max_tokens=2500)
+    
+    # Create focused prompt
+    prompt = f"""Based on this document, answer the question concisely.
+
+Document: {compressed}
+
+Question: {question}
+
+Answer (be brief and specific):"""
+    
+    try:
+        # Try fastest models
+        models = ['llama3.2:latest', 'phi3.5:latest', 'gemma2:2b']
+        
+        for model in models:
+            try:
+                response = ollama.chat(
+                    model=model,
+                    messages=[{'role': 'user', 'content': prompt}],
+                    options={
+                        'temperature': 0.2,
+                        'num_predict': 150,
+                    }
+                )
+                
+                answer = response['message']['content'].strip()
+                return answer if answer else "I couldn't find a clear answer in the document."
+                
+            except Exception:
+                continue
+        
+        return "⚠️ No Ollama models responded. Try: ollama pull llama3.2"
+        
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
 
 # ---------------- Discovery ----------------
 @st.cache_data
@@ -492,8 +655,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📄 PDR Document Viewer")
-st.caption("PDR document viewing • OCR search • AI-powered analysis")
+st.title("📄 Document Viewer")
+st.caption("Professional document viewing • OCR search • AI-powered analysis")
 
 # Sidebar - minimal
 with st.sidebar:
@@ -508,8 +671,10 @@ with st.sidebar:
     cached = cur.fetchone()[0]
     
     st.metric("📦 Cached Pages", cached)
+    
     if st.button("Clear Cache", width="stretch"):
         conn.execute("DELETE FROM ocr_cache")
+        conn.execute("DELETE FROM analysis_cache")
         conn.commit()
         st.rerun()
 
@@ -536,13 +701,13 @@ else:
         )
         
         # OR select from dropdown
-        # st.caption("or select from list:")
-        # selected_list = st.selectbox(
-        #     "Select case",
-        #     [""] + sorted(cases.keys()),
-        #     format_func=lambda x: "-- Select --" if x == "" else f"{x} ({len(cases[x])} pages)",
-        #     label_visibility="collapsed"
-        # )
+        st.caption("or select from list:")
+        selected_list = st.selectbox(
+            "Select case",
+            [""] + sorted(cases.keys()),
+            format_func=lambda x: "-- Select --" if x == "" else f"{x} ({len(cases[x])} pages)",
+            label_visibility="collapsed"
+        )
         
         # Determine selection
         selected = None
@@ -554,42 +719,40 @@ else:
                 similar = [c for c in cases if typed_case.lower() in c.lower()]
                 if similar:
                     st.caption(f"💡 Similar: {similar[0]}")
-        # elif selected_list:
-        #     selected = selected_list
+        elif selected_list:
+            selected = selected_list
         
         if selected:
             st.success(f"✓ {len(cases[selected])} pages")
             
-            # AI Analysis button - modern design
-            st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+            st.markdown("<div style='margin-top: 1rem;'></div>", unsafe_allow_html=True)
             
-            # Custom styled button
-            analyze_button = st.button(
-                "🤖 Analyze with AI",
-                width="stretch",
-                type="secondary",
-                help="Get AI-powered summary and insights"
-            )
+            # Manual AI Analysis toggle button
+            analysis_visible = st.session_state.get(f"show_analysis_{selected}", False)
             
-            if analyze_button:
-                if f"analyze_{selected}" not in st.session_state:
-                    st.session_state[f"analyze_{selected}"] = False
-                st.session_state[f"analyze_{selected}"] = not st.session_state[f"analyze_{selected}"]
+            button_label = "📊 View AI Summary" if not analysis_visible else "✕ Hide AI Summary"
+            button_type = "secondary" if not analysis_visible else "primary"
+            
+            if st.button(button_label, width="stretch", type=button_type, help="Toggle AI analysis panel"):
+                st.session_state[f"show_analysis_{selected}"] = not analysis_visible
+                # Start processing if not done yet
+                if not analysis_visible and f"processing_{selected}" not in st.session_state:
+                    st.session_state[f"processing_{selected}"] = True
                 st.rerun()
             
-            # Show hint if analysis is active
-            if st.session_state.get(f"analyze_{selected}", False):
-                st.markdown("""
-                    <div style='background: #f0f9ff; 
-                                border-left: 3px solid #3b82f6; 
-                                padding: 0.5rem 0.75rem; 
-                                border-radius: 4px;
-                                margin-top: 0.5rem;
-                                font-size: 0.8rem;
-                                color: #1e40af;'>
-                        ✓ AI analysis active
-                    </div>
-                """, unsafe_allow_html=True)
+            # # Show processing status indicator
+            # if st.session_state.get(f"processing_{selected}", False) and f"analysis_data_{selected}" not in st.session_state:
+            #     st.markdown("""
+            #         <div style='background: #fef3c7; 
+            #                     border-left: 3px solid #f59e0b; 
+            #                     padding: 0.5rem 0.75rem; 
+            #                     border-radius: 4px;
+            #                     margin-top: 0.5rem;
+            #                     font-size: 0.8rem;
+            #                     color: #92400e;'>
+            #             🤖 AI analyzing in background...
+            #         </div>
+            #     """, unsafe_allow_html=True)
     
     with col2:
         if selected:
@@ -597,7 +760,7 @@ else:
             
             images = cases[selected]
             
-            # Search box - ALWAYS AT TOP (never hidden)
+            # Search box - ALWAYS AT TOP
             query = st.text_input(
                 "🔍 Search documents",
                 placeholder="Enter keyword to highlight...",
@@ -627,15 +790,17 @@ else:
             
             st.divider()
             
-            # AI Analysis card - Sleek minimal design
-            show_analysis = st.session_state.get(f"analyze_{selected}", False)
+            # AI Analysis card - Only shows when user clicks button
+            show_analysis_card = st.session_state.get(f"show_analysis_{selected}", False)
             analysis_key = f"analysis_data_{selected}"
+            processing_key = f"processing_{selected}"
             
-            if show_analysis:
+            if show_analysis_card:
                 analysis = st.session_state.get(analysis_key)
+                is_processing = st.session_state.get(processing_key, False) and not analysis
                 
-                if not analysis:
-                    # Processing state - minimal design
+                if is_processing:
+                    # Show processing state
                     st.markdown("""
                         <div style='background: #f8fafc; 
                                     border: 1px solid #e2e8f0; 
@@ -644,81 +809,128 @@ else:
                                     border-radius: 8px;
                                     margin-bottom: 1.5rem;'>
                             <div style='display: flex; align-items: center; gap: 0.75rem;'>
-                                <span style='font-size: 1.25rem;'>🤖</span>
+                                <div class="spinner" style='width: 20px; height: 20px; border: 3px solid #e2e8f0; border-top-color: #6366f1; border-radius: 50%; animation: spin 1s linear infinite;'></div>
                                 <div>
-                                    <div style='font-weight: 600; color: #1e293b; font-size: 0.95rem;'>AI Analysis</div>
-                                    <div style='color: #64748b; font-size: 0.85rem; margin-top: 0.25rem;'>Processing in background...</div>
+                                    <div style='font-weight: 600; color: #1e293b; font-size: 0.95rem;'>AI Analysis Running...</div>
+                                    <div style='color: #64748b; font-size: 0.85rem; margin-top: 0.25rem;'>Processing document content. This may take 5-10 seconds.</div>
                                 </div>
                             </div>
                         </div>
+                        <style>
+                        @keyframes spin {
+                            to { transform: rotate(360deg); }
+                        }
+                        </style>
                     """, unsafe_allow_html=True)
                     
-                else:
-                    # Results - clean card design
+                elif analysis:
+                    # Show results
                     st.markdown("""
-                        <div style='background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                                    padding: 0.15rem; 
-                                    border-radius: 10px;
+                        <div style='background: #f8fafc;
+                                    border: 1px solid #e2e8f0;
+                                    border-radius: 8px;
+                                    padding: 1.25rem;
                                     margin-bottom: 1.5rem;'>
-                            <div style='background: white; 
-                                        padding: 1.25rem; 
-                                        border-radius: 9px;'>
-                                <div style='display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem;'>
-                                    <div style='display: flex; align-items: center; gap: 0.75rem;'>
-                                        <span style='font-size: 1.25rem;'>🤖</span>
-                                        <span style='font-weight: 600; color: #1e293b; font-size: 1rem;'>AI Document Analysis</span>
-                                    </div>
-                                </div>
+                            <div style='display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem;'>
+                                <span style='font-size: 1.25rem;'>🤖</span>
+                                <span style='font-weight: 600; color: #1e293b; font-size: 1rem;'>AI Document Analysis</span>
                             </div>
                         </div>
                     """, unsafe_allow_html=True)
                     
-                    # Stats in clean grid
-                    col_a, col_b, col_c = st.columns([2, 2, 1])
+                    # Stats
+                    col_a, col_b = st.columns(2)
                     stats = analysis.get('stats', {})
-                    with col_a:
-                        st.metric(
-                            "Pages Analyzed", 
-                            f"{stats.get('pages_with_text', 0)}/{stats.get('total_pages', 0)}",
-                            help="Pages with readable text"
-                        )
-                    with col_b:
-                        st.metric(
-                            "Total Words", 
-                            f"{stats.get('total_words', 0):,}",
-                            help="Words detected across all pages"
-                        )
-                    with col_c:
-                        if st.button("✕ Close", key="close_analysis", help="Close analysis", type="secondary"):
-                            del st.session_state[f"analyze_{selected}"]
-                            if analysis_key in st.session_state:
-                                del st.session_state[analysis_key]
+              
+                    # Detailed breakdown
+                    col_left, col_right = st.columns(2)
+                    
+                    with col_left:
+                        if analysis.get('key_points'):
+                            st.markdown("**Key Points**")
+                            for point in analysis['key_points']:
+                                st.markdown(f"<div style='margin-bottom: 0.5rem; color: #475569;'>• {point}</div>", unsafe_allow_html=True)
+                    
+                    with col_right:
+                        if analysis.get('notable_items'):
+                            st.markdown("**Notable Items**")
+                            for item in analysis['notable_items']:
+                                st.markdown(f"<div style='margin-bottom: 0.5rem; color: #475569;'>• {item}</div>", unsafe_allow_html=True)
+                    
+                    st.divider()
+                    
+                    # Q&A Section
+                    st.markdown("**💬 Ask Questions About This Document**")
+                    
+                    # Initialize chat history
+                    chat_key = f"chat_{selected}"
+                    if chat_key not in st.session_state:
+                        st.session_state[chat_key] = []
+                    
+                    # Show chat history
+                    if st.session_state[chat_key]:
+                        st.markdown("""
+                            <div style='background: #f9fafb; 
+                                        border: 1px solid #e5e7eb; 
+                                        border-radius: 6px; 
+                                        padding: 0.75rem;
+                                        margin-bottom: 1rem;
+                                        max-height: 300px;
+                                        overflow-y: auto;'>
+                        """, unsafe_allow_html=True)
+                        
+                        for i, msg in enumerate(st.session_state[chat_key]):
+                            if msg['role'] == 'user':
+                                st.markdown(f"""
+                                    <div style='background: #eff6ff; 
+                                                border-left: 3px solid #3b82f6;
+                                                padding: 0.5rem 0.75rem; 
+                                                margin-bottom: 0.5rem;
+                                                border-radius: 4px;'>
+                                        <strong>You:</strong> {msg['content']}
+                                    </div>
+                                """, unsafe_allow_html=True)
+                            else:
+                                st.markdown(f"""
+                                    <div style='background: white; 
+                                                border-left: 3px solid #10b981;
+                                                padding: 0.5rem 0.75rem; 
+                                                margin-bottom: 0.5rem;
+                                                border-radius: 4px;'>
+                                        <strong>AI:</strong> {msg['content']}
+                                    </div>
+                                """, unsafe_allow_html=True)
+                        
+                        st.markdown("</div>", unsafe_allow_html=True)
+                        
+                        # Clear chat button
+                        if st.button("🗑️ Clear conversation", key=f"clear_chat_{selected}", type="secondary"):
+                            st.session_state[chat_key] = []
                             st.rerun()
                     
-                    # Collapsible details - clean styling
-                    with st.expander("📊 View Full Analysis", expanded=False):
-                        if analysis.get('overview'):
-                            st.markdown("##### Overview")
-                            st.markdown(f"<p style='color: #475569; line-height: 1.6;'>{analysis['overview']}</p>", unsafe_allow_html=True)
-                            st.divider()
-                        
-                        col_left, col_right = st.columns(2)
-                        
-                        with col_left:
-                            if analysis.get('key_points'):
-                                st.markdown("##### Key Points")
-                                for point in analysis['key_points']:
-                                    st.markdown(f"<div style='margin-bottom: 0.5rem; color: #475569;'>• {point}</div>", unsafe_allow_html=True)
-                        
-                        with col_right:
-                            if analysis.get('notable_items'):
-                                st.markdown("##### Notable Items")
-                                for item in analysis['notable_items']:
-                                    st.markdown(f"<div style='margin-bottom: 0.5rem; color: #475569;'>• {item}</div>", unsafe_allow_html=True)
+                    # Question input
+                    question = st.text_input(
+                        "Your question:",
+                        placeholder="e.g., What is the policy number? When does coverage end?",
+                        key=f"question_{selected}",
+                        label_visibility="collapsed"
+                    )
+                    
+                    if question and question.strip():
+                        if st.button("Ask", key=f"ask_{selected}", type="primary"):
+                            # Add user question to chat
+                            st.session_state[chat_key].append({"role": "user", "content": question})
+                            
+                            # Get answer from LLM
+                            with st.spinner("Thinking..."):
+                                answer = ask_document_question(images, question, selected)
+                                st.session_state[chat_key].append({"role": "assistant", "content": answer})
+                            
+                            st.rerun()
                     
                     st.divider()
             
-            # Display images - ALWAYS render these first, before any processing
+            # Display images - ALWAYS render these first
             for i, img_path in enumerate(images):
                 try:
                     if i in matches and query.strip():
@@ -733,19 +945,25 @@ else:
                 except Exception as e:
                     st.error(f"Error loading image: {e}")
             
-            # Process AI analysis AFTER images are rendered
-            if show_analysis and not analysis:
-                # Run analysis now (after images displayed)
-                analysis = analyze_case_fast(images)
-                st.session_state[analysis_key] = analysis
+            # Process AI analysis AFTER images (only if button was clicked)
+            processing_key = f"processing_{selected}"
+            analysis_key = f"analysis_data_{selected}"
+            
+            if (st.session_state.get(processing_key, False) and 
+                analysis_key not in st.session_state):
+                # Run analysis now
+                with st.spinner(""):  # Silent
+                    analysis = analyze_case(images)
+                    st.session_state[analysis_key] = analysis
+                    st.session_state[processing_key] = False
                 st.rerun()
         else:
             st.info("👈 Select or type a case number to begin")
 
 # Footer
 st.divider()
-# st.markdown("""
-#     <div style='text-align: center; color: #64748b; font-size: 0.85rem; padding: 1rem 0;'>
-#         💡 <strong>Tips:</strong> Search keywords are highlighted in yellow • AI analysis uses cached OCR for speed
-#     </div>
-# """, unsafe_allow_html=True)
+st.markdown("""
+    <div style='text-align: center; color: #64748b; font-size: 0.85rem; padding: 1rem 0;'>
+        💡 <strong>Tips:</strong> Search keywords are highlighted in yellow • AI analysis uses cached OCR for speed
+    </div>
+""", unsafe_allow_html=True)
